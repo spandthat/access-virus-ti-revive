@@ -1,13 +1,19 @@
 // vtimidiports - Windows MIDI ports for the Virus TI (design-midi-ports.md, option A).
 //
-// Creates a Windows MIDI Services virtual device "Virus TI" with two MIDI 1.0 function blocks and relays them to the
-// Virus through the TI Revive broker (it is just another pipe client, vtiproto.h):
-//   group 0 "Virus TI Synth" <-> USB-MIDI cable 1 on MI_03 (the synth engine: keys, knobs, notes in)
-//   group 1 "Virus TI MIDI"  <-> USB-MIDI cable 0 on MI_03 (the Virus' MIDI In/Out DIN sockets)
+// Creates two Windows MIDI Services virtual devices and relays them to the Virus through the TI Revive broker (it is
+// just another pipe client, vtiproto.h):
+//   "Virus TI Synth (Revive)" <-> USB-MIDI cable 1 on MI_03 (the synth engine: keys, knobs, notes in)
+//   "Virus TI MIDI (Revive)"  <-> USB-MIDI cable 0 on MI_03 (the Virus' MIDI In/Out DIN sockets)
+// One device per port because Windows names a device's MIDI 1.0 ports "<device>", "<device> Gr 2", ... and refuses a
+// runtime custom name for virtual devices; one group each gives exactly the names above.
 // Synth -> PC: EP 0x85 packets are split by cable and sent as UMP. PC -> synth: UMP is packed into USB-MIDI packets
 // and written to EP 0x05. The plug-in's own channel (MI_04, cables 2/3) is not touched.
 //
-// Needs the Windows MIDI Services runtime (winget Microsoft.MIDI.SDK). Log: %TEMP%\vtimidiports.log.
+// Needs Windows MIDI Services (in-box on Windows 11 25H2+); the Windows.Devices.Midi2 API ships app-local from the
+// preview NuGet package until it is in-box. Log: %TEMP%\vtimidiports.log.
+//
+// Stop it with `vtimidiports --quit`, not by killing it: a killed process leaves its virtual devices registered and the
+// Windows MIDI Service then hangs on the next MidiSession.Create until it is restarted (seen on 26H2, 2026-10-14).
 
 using System.IO.Pipes;
 using Windows.Devices.Midi2;
@@ -16,21 +22,31 @@ using Windows.Devices.Midi2.Transports.Virtual;
 
 namespace TiRevive.MidiPorts;
 
+sealed class Port
+{
+    public required string Name;
+    public required string ProductInstanceId;
+    public required byte Cable;
+    public MidiEndpointConnection? Conn;
+    public readonly List<byte> SysexIn = new();   // synth -> PC, without F0/F7
+    public bool SysexInStarted;
+    public readonly List<byte> SysexOut = new();  // PC -> synth, with F0/F7
+}
+
 static class Program
 {
     const ushort MSG_HELLO = 1, MSG_WRITE = 2, MSG_RX = 0x81, MSG_STATE = 0x84;
     const byte EP_MI03_OUT = 0x05, EP_MI03_IN = 0x85;
     const int PROTO = 3;
 
-    static readonly string[] BlockNames = { "Virus TI Synth", "Virus TI MIDI" };
-    static readonly byte[] GroupToCable = { 1, 0 };
+    static readonly Port[] Ports = {
+        new() { Name = "Virus TI Synth (Revive)", ProductInstanceId = "TIREVIVE_VIRUS_TI_SYNTH", Cable = 1 },
+        new() { Name = "Virus TI MIDI (Revive)", ProductInstanceId = "TIREVIVE_VIRUS_TI_MIDI", Cable = 0 },
+    };
 
     static StreamWriter? _log;
     static NamedPipeClientStream? _pipe;
     static readonly object _pipeLock = new();
-    static MidiEndpointConnection? _conn;
-    static readonly SysexIn[] _sysexIn = { new(), new() };   // per cable 0/1, synth -> PC
-    static readonly List<byte>[] _sysexOut = { new(), new() }; // per group 0/1, PC -> synth
 
     static void Log(string s)
     {
@@ -42,36 +58,66 @@ static class Program
 
     static int Main(string[] args)
     {
-        _log = new StreamWriter(Path.Combine(Path.GetTempPath(), "vtimidiports.log"), append: true);
+        _log = new StreamWriter(new FileStream(Path.Combine(Path.GetTempPath(), "vtimidiports.log"), FileMode.Append,
+            FileAccess.Write, FileShare.ReadWrite | FileShare.Delete));
+        using var quit = new EventWaitHandle(false, EventResetMode.ManualReset, @"Local\TiReviveMidiPorts.Quit");
+        if (args.Length > 0 && args[0] == "--quit") { // ask a running instance to close its ports cleanly
+            quit.Set();
+            return 0;
+        }
         using var single = new Mutex(true, @"Local\TiReviveMidiPorts", out bool first);
         if (!first) {
             Log("already running");
             return 0;
         }
+        quit.Reset();
+        Log($"start, pid {Environment.ProcessId}");
         try {
             if (!MidiApi.EnsureServiceAvailable()) {
                 Log("Windows MIDI Service not available (needs Windows 11 25H2 or newer)");
                 return 3;
             }
             using var session = MidiSession.Create("TI Revive MIDI ports");
-            var device = MidiVirtualDeviceManager.CreateVirtualDevice(DefineDevice());
-            if (device == null) {
-                Log("could not create the virtual device");
-                return 4;
+            foreach (var port in Ports) {
+                // the service can refuse right after it started; give it a few tries
+                MidiVirtualDevice? device = null;
+                for (int attempt = 0; device == null && attempt < 5; attempt++) {
+                    if (attempt > 0)
+                        Thread.Sleep(2000);
+                    device = MidiVirtualDeviceManager.CreateVirtualDevice(DefineDevice(port));
+                }
+                if (device == null) {
+                    Log($"could not create the virtual device {port.Name}");
+                    return 4;
+                }
+                device.SuppressHandledMessages = true;
+                var conn = session.CreateEndpointConnection(device.DeviceEndpointDeviceId);
+                if (conn.AddMessageProcessingPlugin(device) != MidiMessageProcessingPluginAddResult.Succeeded) {
+                    Log($"could not attach the virtual device {port.Name}");
+                    return 5;
+                }
+                var p = port;
+                conn.MessageReceived += (_, e) => FromApp(p, e.GetMessagePacket().GetAllWords());
+                if (!conn.Open()) {
+                    Log($"could not open the virtual device {port.Name}");
+                    return 5;
+                }
+                port.Conn = conn;
+                Log($"port up: {port.Name}");
             }
-            device.SuppressHandledMessages = true;
-            _conn = session.CreateEndpointConnection(device.DeviceEndpointDeviceId);
-            if (_conn.AddMessageProcessingPlugin(device) != MidiMessageProcessingPluginAddResult.Succeeded) {
-                Log("could not attach the virtual device to the connection");
-                return 5;
+            new Thread(BrokerLoop) { IsBackground = true }.Start();
+            quit.WaitOne(); // vtimidiports --quit
+            Log("quit requested, closing the ports");
+            lock (_pipeLock) _pipe?.Dispose();
+            foreach (var port in Ports) {
+                if (port.Conn != null)
+                    session.DisconnectEndpointConnection(port.Conn.ConnectionId);
+                port.Conn = null;
             }
-            _conn.MessageReceived += (_, e) => FromApp(e.GetMessagePacket().GetAllWords());
-            if (!_conn.Open()) {
-                Log("could not open the virtual device connection");
-                return 5;
-            }
-            Log($"virtual device up: {device.DeviceEndpointDeviceId}");
-            BrokerLoop(); // runs until the process is ended
+            Log("ports closed");
+            // Disposing the session after the disconnects hung the process on 26H2 (the ports were already gone).
+            // Nothing is left to clean up, so leave without it.
+            Environment.Exit(0);
             return 0;
         } catch (Exception ex) {
             Log("fatal: " + ex);
@@ -79,11 +125,11 @@ static class Program
         }
     }
 
-    static MidiVirtualDeviceCreationConfig DefineDevice()
+    static MidiVirtualDeviceCreationConfig DefineDevice(Port port)
     {
         var info = new MidiDeclaredEndpointInfo {
-            Name = "Virus TI",
-            ProductInstanceId = "TIREVIVE_VIRUS_TI",
+            Name = port.Name,
+            ProductInstanceId = port.ProductInstanceId,
             SpecificationVersionMajor = 1,
             SpecificationVersionMinor = 1,
             SupportsMidi10Protocol = true,
@@ -94,23 +140,21 @@ static class Program
         };
         var identity = new MidiDeclaredDeviceIdentity(0x00, 0x20, 0x33, // Access Music manufacturer id
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
-        var user = new MidiEndpointUserSuppliedInfo { Name = "Virus TI", Description = "Access Virus TI through TI Revive" };
-        var config = new MidiVirtualDeviceCreationConfig("Virus TI", "Access Virus TI through TI Revive", "TI Revive",
+        var user = new MidiEndpointUserSuppliedInfo { Name = port.Name, Description = "Access Virus TI through TI Revive" };
+        var config = new MidiVirtualDeviceCreationConfig(port.Name, "Access Virus TI through TI Revive", "TI Revive",
             info, identity, user);
-        for (int g = 0; g < BlockNames.Length; g++) {
-            config.FunctionBlocks.Add(new MidiFunctionBlock {
-                Number = (byte)g,
-                Name = BlockNames[g],
-                IsActive = true,
-                UIHint = MidiFunctionBlockUIHint.Bidirectional,
-                FirstGroup = new MidiGroup((byte)g),
-                GroupCount = 1,
-                Direction = MidiFunctionBlockDirection.Bidirectional,
-                RepresentsMidi10Connection = MidiFunctionBlockRepresentsMidi10Connection.YesBandwidthRestricted,
-                MaxSystemExclusive8Streams = 0,
-                MidiCIMessageVersionFormat = 0,
-            });
-        }
+        config.FunctionBlocks.Add(new MidiFunctionBlock {
+            Number = 0,
+            Name = port.Name,
+            IsActive = true,
+            UIHint = MidiFunctionBlockUIHint.Bidirectional,
+            FirstGroup = new MidiGroup(0),
+            GroupCount = 1,
+            Direction = MidiFunctionBlockDirection.Bidirectional,
+            RepresentsMidi10Connection = MidiFunctionBlockRepresentsMidi10Connection.YesBandwidthRestricted,
+            MaxSystemExclusive8Streams = 0,
+            MidiCIMessageVersionFormat = 0,
+        });
         return config;
     }
 
@@ -172,97 +216,93 @@ static class Program
 
     // ---- synth -> PC ------------------------------------------------------------------------------------------------
 
-    sealed class SysexIn { public readonly List<byte> Data = new(); public bool Started; }
-
     static void FromSynth(byte[] b, int off, int len)
     {
         for (int i = off; i + 3 < off + len; i += 4) {
             int cable = b[i] >> 4, cin = b[i] & 0x0F;
             byte d0 = b[i + 1], d1 = b[i + 2], d2 = b[i + 3];
-            if (cable > 1 || (b[i] == 0 && d0 == 0))
+            var port = Array.Find(Ports, p => p.Cable == cable);
+            if (port == null || (b[i] == 0 && d0 == 0))
                 continue;
-            int group = Array.IndexOf(GroupToCable, (byte)cable);
             switch (cin) {
             case 0x8: case 0x9: case 0xA: case 0xB: case 0xE: // 3-byte channel voice
-                SendUmp(0x20000000u | (uint)group << 24 | (uint)d0 << 16 | (uint)d1 << 8 | d2);
+                SendUmp(port, 0x20000000u | (uint)d0 << 16 | (uint)d1 << 8 | d2);
                 break;
             case 0xC: case 0xD: // 2-byte channel voice
-                SendUmp(0x20000000u | (uint)group << 24 | (uint)d0 << 16 | (uint)d1 << 8);
+                SendUmp(port, 0x20000000u | (uint)d0 << 16 | (uint)d1 << 8);
                 break;
             case 0x4: // SysEx start or continue, 3 bytes
-                SysexBytes(cable, group, d0, d1, d2);
+                SysexBytes(port, d0, d1, d2);
                 break;
             case 0x5: case 0x6: case 0x7: // SysEx ends with 1/2/3 bytes, or a 1-byte system common message (CIN 5)
-                if (cin == 0x5 && d0 != 0xF7 && !_sysexIn[cable].Started) {
-                    SystemMessage(group, d0, 0, 0);
+                if (cin == 0x5 && d0 != 0xF7 && !port.SysexInStarted) {
+                    SystemMessage(port, d0, 0, 0);
                     break;
                 }
-                SysexBytes(cable, group, cin == 5 ? new[] { d0 } : cin == 6 ? new[] { d0, d1 } : new[] { d0, d1, d2 });
+                SysexBytes(port, cin == 5 ? new[] { d0 } : cin == 6 ? new[] { d0, d1 } : new[] { d0, d1, d2 });
                 break;
             case 0x2: case 0x3: // 2/3-byte system common
-                SystemMessage(group, d0, d1, cin == 3 ? d2 : (byte)0);
+                SystemMessage(port, d0, d1, cin == 3 ? d2 : (byte)0);
                 break;
             case 0xF: // single byte (real time)
                 if (d0 != 0xFE) // Active Sensing stays between the broker and the synth
-                    SystemMessage(group, d0, 0, 0);
+                    SystemMessage(port, d0, 0, 0);
                 break;
             }
         }
     }
 
-    static void SystemMessage(int group, byte s, byte a, byte b) =>
-        SendUmp(0x10000000u | (uint)group << 24 | (uint)s << 16 | (uint)a << 8 | b);
+    static void SystemMessage(Port port, byte s, byte a, byte b) =>
+        SendUmp(port, 0x10000000u | (uint)s << 16 | (uint)a << 8 | b);
 
-    static void SysexBytes(int cable, int group, params byte[] bytes)
+    static void SysexBytes(Port port, params byte[] bytes)
     {
-        var st = _sysexIn[cable];
         foreach (byte x in bytes) {
             if (x == 0xF0) {
-                st.Data.Clear();
-                st.Started = true;
+                port.SysexIn.Clear();
+                port.SysexInStarted = true;
             } else if (x == 0xF7) {
-                if (st.Started)
-                    SendSysex7(group, st.Data);
-                st.Data.Clear();
-                st.Started = false;
-            } else if (st.Started) {
-                st.Data.Add(x);
+                if (port.SysexInStarted)
+                    SendSysex7(port, port.SysexIn);
+                port.SysexIn.Clear();
+                port.SysexInStarted = false;
+            } else if (port.SysexInStarted) {
+                port.SysexIn.Add(x);
             }
         }
     }
 
     // UMP type 3 (7-bit SysEx), up to 6 data bytes per 64-bit packet, F0/F7 not included.
-    static void SendSysex7(int group, List<byte> data)
+    static void SendSysex7(Port port, List<byte> data)
     {
         int n = data.Count, pos = 0;
         do {
             int count = Math.Min(6, n - pos);
             int status = n <= 6 ? 0 : pos == 0 ? 1 : pos + count >= n ? 3 : 2;
             var p = new byte[8];
-            p[0] = (byte)(0x30 | group);
+            p[0] = 0x30;
             p[1] = (byte)(status << 4 | count);
             for (int k = 0; k < count; k++)
                 p[2 + k] = data[pos + k];
             uint w0 = (uint)(p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]);
             uint w1 = (uint)(p[4] << 24 | p[5] << 16 | p[6] << 8 | p[7]);
-            _conn?.SendSingleMessageWords(MidiClock.TimestampConstantSendImmediately, w0, w1);
+            port.Conn?.SendSingleMessageWords(MidiClock.TimestampConstantSendImmediately, w0, w1);
             pos += count;
         } while (pos < n);
     }
 
-    static void SendUmp(uint w0) => _conn?.SendSingleMessageWords(MidiClock.TimestampConstantSendImmediately, w0);
+    static void SendUmp(Port port, uint w0) =>
+        port.Conn?.SendSingleMessageWords(MidiClock.TimestampConstantSendImmediately, w0);
 
     // ---- PC -> synth ------------------------------------------------------------------------------------------------
 
-    static void FromApp(IList<uint> words)
+    static void FromApp(Port port, IList<uint> words)
     {
         if (words.Count == 0)
             return;
         uint w0 = words[0];
-        int mt = (int)(w0 >> 28), group = (int)(w0 >> 24) & 0x0F;
-        if (group >= GroupToCable.Length)
-            return;
-        byte cable = GroupToCable[group];
+        int mt = (int)(w0 >> 28);
+        byte cable = port.Cable;
         byte s = (byte)(w0 >> 16), a = (byte)(w0 >> 8), b = (byte)w0;
         var outp = new List<byte>();
         switch (mt) {
@@ -282,7 +322,7 @@ static class Program
             int status = (int)(w0 >> 20) & 0x0F, count = (int)(w0 >> 16) & 0x0F;
             uint w1 = words[1];
             byte[] d = { a, b, (byte)(w1 >> 24), (byte)(w1 >> 16), (byte)(w1 >> 8), (byte)w1 };
-            var acc = _sysexOut[group];
+            var acc = port.SysexOut;
             if (status == 0 || status == 1) {
                 acc.Clear();
                 acc.Add(0xF0);
