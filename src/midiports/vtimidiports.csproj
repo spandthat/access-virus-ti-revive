@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <WindowsSDKPackageVersion>10.0.26100.57</WindowsSDKPackageVersion>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Nullable>enable</Nullable>
+    <AssemblyName>vtimidiports</AssemblyName>
+    <RootNamespace>TiRevive.MidiPorts</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <CSWinRTInputs>Windows.Devices.Midi2</CSWinRTInputs>
+    <CsWinRTIncludes>Windows.Devices.Midi2</CsWinRTIncludes>
+    <!-- no Windows SDK needed: take the Windows metadata from this machine (System32WinMetadata) -->
+    <CsWinRTWindowsMetadata>local</CsWinRTWindowsMetadata>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Windows.CsWinRT" Version="2.2.0" />
+    <PackageReference Include="Windows.Devices.Midi2" Version="0.99.92-preview.11" />
+  </ItemGroup>
+
+</Project>
