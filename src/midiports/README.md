@@ -59,4 +59,7 @@ from GitHub (winget fails with 404) and is not needed.
 
 - Keys while the plug-in is open: note on/off and channel pressure arrive on EP 0x85 cable 1; knobs come on EP 0x86
   cable 2 (the plug-in's channel), so they are not on these ports.
-- Latency through the ports is not measured yet.
+- Latency added by the ports (2026-10-14, 30 key presses, Ableton running): each note-on timed when the broker
+  pipe delivers it (EP 0x85 cable 1) and when it arrives on the WinMM input "Virus TI Synth (Revive)", both in one
+  process: **median 0.18 ms, p95 0.37 ms, max 1.28 ms**, 30 of 30 delivered. The keys are sent over USB with the
+  plug-in's Direct (D) button on and off.
