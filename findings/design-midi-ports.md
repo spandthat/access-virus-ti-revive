@@ -1,6 +1,9 @@
 # Design proposal: Windows MIDI ports for the Virus TI
 
 Status: proposal (2026-10-11), not implemented. Plan item 3 in `HANDOFF.md`.
+**Update 2026-10-14: option A is implemented as a prototype in [`src/midiports`](../src/midiports/README.md)** (C#, a
+separate broker client, two virtual devices). Works on Windows 11 26H2 with the Virus keys playing the plug-in in
+Ableton Live 12. Not in the installer yet; see its README for the Windows MIDI Service hang when the process is killed.
 
 ## Goal
 
