@@ -334,6 +334,17 @@ static int broker_audio(void)
         // plain aligned 64-bit read (atomic on x64); no interlocked op: the mapping is read-only (lock cmpxchg
         // writes and faults there). The broker publishes in_frames after the data, x64 keeps the load order.
         int64_t wr = *(volatile const int64_t *)&shm->in_frames;
+        if (w == WAIT_TIMEOUT && wr != pos) {
+            // Frames arrived but our event was not signalled: the broker dropped our registration because the broker
+            // connection it belonged to was closed (the plug-in closed its device handles, e.g. a Live set was closed,
+            // and reopened them on a new connection). The stream itself kept running for another client (the TI
+            // Revive ASIO driver), so the "stalled" check below never fires and the plug-in would be clocked by this
+            // 200 ms timeout in 4096-frame lumps: random F5 timestamps, continuous sync errors, messy playback
+            // (seen 2026-10-14 on Windows 11, Ableton Live 12: 15 deliveries/s, max gap 215 ms). Register again.
+            v = vtiemu_dev();
+            int rr = v ? vti_audio(v, 1, name) : -1;
+            vtiemu_log("audio: broker stopped signalling while the stream runs, re-registered (%d)", rr);
+        }
         if (wr == pos) {
             if (w == WAIT_TIMEOUT && ++idle >= 5) { // 1 s without audio: broker restarted or stream stopped
                 idle = 0;
