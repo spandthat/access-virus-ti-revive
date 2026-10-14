@@ -334,7 +334,13 @@ static int broker_audio(void)
         // plain aligned 64-bit read (atomic on x64); no interlocked op: the mapping is read-only (lock cmpxchg
         // writes and faults there). The broker publishes in_frames after the data, x64 keeps the load order.
         int64_t wr = *(volatile const int64_t *)&shm->in_frames;
-        if (w == WAIT_TIMEOUT && wr != pos) {
+        // Only while the plug-in's stream runs (output ring and buffer-switch event registered), and at most once per
+        // second: while a Live set loads, the plug-in is still setting up and closes/reopens its stream several times
+        // (2026-10-14: Live crashed inside Virus Control.dll during a set load right after the first version of this
+        // re-registered at once; not proven to be the cause, but the plug-in should be left alone until it is ready).
+        static DWORD last_rereg;
+        if (w == WAIT_TIMEOUT && wr != pos && g_out_sm && g_bs_event && GetTickCount() - last_rereg > 1000) {
+            last_rereg = GetTickCount();
             // Frames arrived but our event was not signalled: the broker dropped our registration because the broker
             // connection it belonged to was closed (the plug-in closed its device handles, e.g. a Live set was closed,
             // and reopened them on a new connection). The stream itself kept running for another client (the TI
