@@ -13,7 +13,8 @@
 // preview NuGet package until it is in-box. Log: %TEMP%\vtimidiports.log.
 //
 // Stop it with `vtimidiports --quit`, not by killing it: a killed process leaves its virtual devices registered and the
-// Windows MIDI Service then hangs on the next MidiSession.Create until it is restarted (seen on 26H2, 2026-10-14).
+// Windows MIDI Service then hangs on the next MidiSession.Create until it is restarted (seen on 26H2, 2026-10-14, and
+// by the TI Revive author in E090). --quit detaches the devices (RemoveMessageProcessingPlugin) before disconnecting.
 
 using System.IO.Pipes;
 using Windows.Devices.Midi2;
@@ -28,6 +29,7 @@ sealed class Port
     public required string ProductInstanceId;
     public required byte Cable;
     public MidiEndpointConnection? Conn;
+    public MidiVirtualDevice? Device;
     public readonly List<byte> SysexIn = new();   // synth -> PC, without F0/F7
     public bool SysexInStarted;
     public readonly List<byte> SysexOut = new();  // PC -> synth, with F0/F7
@@ -103,6 +105,7 @@ static class Program
                     return 5;
                 }
                 port.Conn = conn;
+                port.Device = device;
                 Log($"port up: {port.Name}");
             }
             new Thread(BrokerLoop) { IsBackground = true }.Start();
@@ -110,9 +113,14 @@ static class Program
             Log("quit requested, closing the ports");
             lock (_pipeLock) _pipe?.Dispose();
             foreach (var port in Ports) {
+                // detach the virtual device first: without this the service keeps the device registered and hangs
+                // on the next CreateVirtualDevice (the author's E090)
+                if (port.Conn != null && port.Device != null)
+                    port.Conn.RemoveMessageProcessingPlugin(port.Device.PluginId);
                 if (port.Conn != null)
                     session.DisconnectEndpointConnection(port.Conn.ConnectionId);
                 port.Conn = null;
+                port.Device = null;
             }
             Log("ports closed");
             // Disposing the session after the disconnects hung the process on 26H2 (the ports were already gone).
@@ -181,12 +189,35 @@ static class Program
                         FromSynth(buf, 1, len - 1);
                 }
             } catch (TimeoutException) {
-                // broker not running yet: it starts on demand; keep trying
+                // broker not running: it normally starts on demand with the plug-in; start it so the ports also work
+                // without the plug-in (as the author's prototype did, E090)
+                StartBroker();
             } catch (Exception ex) {
                 Log("broker connection lost: " + ex.Message);
             }
             lock (_pipeLock) _pipe = null;
             Thread.Sleep(2000);
+        }
+    }
+
+    static DateTime _lastBrokerStart = DateTime.MinValue;
+
+    static void StartBroker()
+    {
+        if (DateTime.Now - _lastBrokerStart < TimeSpan.FromSeconds(30))
+            return;
+        _lastBrokerStart = DateTime.Now;
+        var dir = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\TI Revive", "InstallDir", null) as string;
+        var exe = dir == null ? null : Path.Combine(dir, "vtibroker.exe");
+        if (exe == null || !File.Exists(exe)) {
+            Log("vtibroker.exe not found (TI Revive not installed?)");
+            return;
+        }
+        try {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false, CreateNoWindow = true });
+            Log("started vtibroker");
+        } catch (Exception ex) {
+            Log("could not start vtibroker: " + ex.Message);
         }
     }
 

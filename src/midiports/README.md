@@ -34,7 +34,8 @@ from GitHub (winget fails with 404) and is not needed.
 
 ## Use
 
-- Run `vtimidiports.exe`. It waits for the broker (which starts on demand) and reconnects by itself.
+- Run `vtimidiports.exe`. If the broker is not running it starts it (`InstallDir` from `HKLM\SOFTWARE\TI Revive`, at
+  most every 30 s), so the ports also work without the plug-in; it reconnects by itself.
 - Stop it with **`vtimidiports.exe --quit`**. Only one instance runs at a time.
 - Log: `%TEMP%\vtimidiports.log`.
 - In Ableton Live: *Settings → Tempo & MIDI → Input Ports*, turn **Track** on for "Virus TI Synth (Revive)", then set
@@ -47,6 +48,8 @@ from GitHub (winget fails with 404) and is not needed.
   Service then hangs in `MidiSession.Create` for every program until `midisrv` is restarted. `Restart-Service midisrv`
   itself hangs in *stop pending*; what works (elevated):
   `Stop-Process -Name MidiSrv -Force; Start-Service midisrv`. Seen three times on 2026-10-14.
+- `--quit` detaches each virtual device (`RemoveMessageProcessingPlugin`) before disconnecting, as the author's own
+  prototype (upstream branch `midi-ports`, E089/E090, which hit the same hang) does. Not yet verified to avoid it.
 - Disposing the MIDI session after the ports were disconnected also hung (the ports were already gone), so `--quit`
   exits straight after the disconnects. Even so, one `--quit` was followed by a service hang once the process was
   killed. Until this is understood: start it once (at logon) and leave it running; Windows shuts it down at logoff.
