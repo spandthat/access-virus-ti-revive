@@ -159,7 +159,7 @@ static class Program
             FirstGroup = new MidiGroup(0),
             GroupCount = 1,
             Direction = MidiFunctionBlockDirection.Bidirectional,
-            RepresentsMidi10Connection = MidiFunctionBlockRepresentsMidi10Connection.YesBandwidthRestricted,
+            RepresentsMidi10Connection = MidiFunctionBlockRepresentsMidi10Connection.YesBandwidthUnrestricted,
             MaxSystemExclusive8Streams = 0,
             MidiCIMessageVersionFormat = 0,
         });
