@@ -49,10 +49,11 @@ static class Program
     static StreamWriter? _log;
     static NamedPipeClientStream? _pipe;
     static readonly object _pipeLock = new();
+    static readonly object _logLock = new();
 
     static void Log(string s)
     {
-        lock (_pipeLock) {
+        lock (_logLock) {
             _log?.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {s}");
             _log?.Flush();
         }
@@ -172,7 +173,9 @@ static class Program
     {
         for (;;) {
             try {
-                using var pipe = new NamedPipeClientStream(".", "vtibroker", PipeDirection.InOut);
+                using var pipe = new NamedPipeClientStream(".", "vtibroker", PipeDirection.InOut, PipeOptions.Asynchronous);
+                // Asynchronous = FILE_FLAG_OVERLAPPED: without it Windows serialises I/O on the handle, so the reader
+                // thread's pending Read blocks every Write (nothing ever reached the Virus; TI Revive E047)
                 pipe.Connect(2000);
                 lock (_pipeLock) _pipe = pipe;
                 Send(MSG_HELLO, BitConverter.GetBytes(PROTO));
