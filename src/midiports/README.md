@@ -58,6 +58,15 @@ from GitHub (winget fails with 404) and is not needed.
   runtime custom port name (`MidiServiceEndpointCustomizationConfig` → `ErrorFromService`). That is why there are two
   virtual devices with one group each instead of one device with two function blocks.
 
+## Fixed 2026-10-22: output to the Virus
+
+Until commit de6aec9 nothing sent TO the ports reached the Virus (WinMM `midiOutShortMsg`/`midiOutLongMsg`
+returned `MMSYSERR_ERROR`; a Windows MIDI Services send "succeeded" and vanished), while input worked. Cause: the
+broker pipe was a synchronous handle, so the reader's pending `Read` blocked every `Write` (TI Revive E047). Now
+`PipeOptions.Asynchronous`. Verified after a login on 0.8.29: WinMM `F0 7E 7F 06 01 F7` and `FE` return 0 and the
+broker observer shows the SysEx going PC -> Virus on cable 1. (An earlier change to bandwidth-unrestricted function
+blocks, dfb9f2c, did not fix it on its own.)
+
 ## Measured
 
 - Keys while the plug-in is open: note on/off and channel pressure arrive on EP 0x85 cable 1; knobs come on EP 0x86
